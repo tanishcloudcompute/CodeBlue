@@ -1,9 +1,17 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const twilio = require("twilio");
-const path = require('path');
-const fs = require('fs');
-require('dotenv').config();
+import express from 'express';
+import bodyParser from 'body-parser';
+import twilio from 'twilio';
+import path from 'path';
+import dotenv from 'dotenv';
+import admin from 'firebase-admin';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import fs from 'fs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+dotenv.config();
+
 const app = express();
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -12,6 +20,21 @@ app.use(bodyParser.urlencoded({ extended: false }));
 const accountSid = process.env.TWILIO_SID;
 const authToken = process.env.TWILIO_AUTH;
 
+// Dynamic import with assertion
+const serviceAccount = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'serviceAccountKey.json'), 'utf8')
+);
+
+// Initialize the Firebase Admin SDK with your credentials.
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+// Get a Firestore instance.
+const db = admin.firestore();
+
+const client = twilio(accountSid, authToken);
+const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // Add service status tracking
 let serviceStatus = {
@@ -32,9 +55,6 @@ async function checkTwilioStatus() {
   serviceStatus.lastChecked = new Date().toISOString();
 }
 
-const client = twilio(accountSid, authToken);
-const VoiceResponse = twilio.twiml.VoiceResponse;
-
 // Initial Twilio status check
 checkTwilioStatus();
 
@@ -43,16 +63,20 @@ setInterval(checkTwilioStatus, 60000);
 
 let callStatus = [];
 
-// Function to log messages to a file
-function logToFile(phone,message) {
+// Function to log messages to a file and Firestore
+async function logToFile(phone, message) {
   const logMessage = `${new Date().toISOString()} - ${phone} - ${message}\n`;
-  fs.appendFile(path.join(__dirname, 'call_logs.txt'), logMessage, (err) => {
-    if (err) {
-      console.error('Error writing to log file:', err);
-    }
-  });
+  // Log to Firestore
+  try {
+    await db.collection('logs').add({
+      phone,
+      message,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error writing to Firestore log:', error);
+  }
 }
-
 
 // Function to create a call
 async function createCall(sender) {
@@ -63,7 +87,6 @@ async function createCall(sender) {
     action: `${process.env.HOST_IP}/processResponse`,
     method: 'POST'
   });
-
   gather.say(
     'Attention: Code Blue. This is an emergency alert from BITS Goa Medical Center. If you are available to respond immediately, please press 1; if not, press 2.',
     { voice: 'alice' }
@@ -93,37 +116,35 @@ app.post('/hotline', async (req, res) => {
   // Clear callStatus array
   callStatus = [];
   // Clear call_status.json and shift data to hotline_history.json
-  fs.readFile(path.join(__dirname, 'call_status.json'), 'utf8', (err, callData) => {
-    if (err && err.code !== 'ENOENT') {
-      console.error('Error reading call status file:', err);
-    } else {
-      const callStatusData = callData ? JSON.parse(callData) : [];
-      fs.readFile(path.join(__dirname, 'hotline_history.json'), 'utf8', (err, historyData) => {
-        if (err && err.code !== 'ENOENT') {
-          console.error('Error reading hotline history file:', err);
-        } else {
-          const hotlineHistory = historyData ? JSON.parse(historyData) : [];
-          const updatedHistory = hotlineHistory.concat(callStatusData);
-          fs.writeFile(path.join(__dirname, 'hotline_history.json'), JSON.stringify(updatedHistory, null, 2), (err) => {
-            if (err) {
-              console.error('Error writing to hotline history file:', err);
-            }
-          });
-        }
-      });
-    }
+  try {
+    const callStatusSnapshot = await db.collection('call_status').get();
+    const callStatusData = callStatusSnapshot.docs.map(doc => doc.data());
 
-    fs.writeFile(path.join(__dirname, 'call_status.json'), JSON.stringify([], null, 2), (err) => {
-      if (err) {
-        console.error('Error clearing call status file:', err);
-      }
+    const hotlineHistorySnapshot = await db.collection('hotline_history').get();
+    const hotlineHistoryData = hotlineHistorySnapshot.docs.map(doc => doc.data());
+
+    const updatedHistory = hotlineHistoryData.concat(callStatusData);
+
+    // Clear call_status collection
+    const batch = db.batch();
+    callStatusSnapshot.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+
+    // Add updated history to hotline_history collection
+    const historyBatch = db.batch();
+    updatedHistory.forEach(entry => {
+      const docRef = db.collection('hotline_history').doc();
+      historyBatch.set(docRef, entry);
     });
-  });
-  fs.readFile(path.join(__dirname, 'public', 'members.json'), 'utf8', async (err, data) => {
-    if (err) {
-      return res.status(500).send({ message: 'Error reading members file', error: err });
-    }
-    const members = JSON.parse(data);
+    await historyBatch.commit();
+  } catch (error) {
+    console.error('Error updating hotline history:', error);
+  }
+
+  try {
+    const membersSnapshot = await db.collection('members').get();
+    const members = membersSnapshot.docs.map(doc => doc.data());
+
     for (const member of members) {
       try {
         await createCall(member.phone);
@@ -133,7 +154,9 @@ app.post('/hotline', async (req, res) => {
     }
 
     res.status(200).send("Hotline calls initiated.");
-  });
+  } catch (error) {
+    res.status(500).send({ message: 'Error reading members from Firestore', error });
+  }
 });
 
 app.post('/processResponse', (req, res) => {
@@ -143,10 +166,10 @@ app.post('/processResponse', (req, res) => {
   console.log('Received input:', digit);
   const call = callStatus.find(call => call.sid === sid);
   const sender = call ? call.phone : 'unknown';
-  logToFile(sender,'Received input: ' + digit);
+  logToFile(sender, 'Received input: ' + digit);
   if (digit === '1') {
     console.log('Emergency call accepted.');
-    logToFile(sender,'Emergency call accepted.');
+    logToFile(sender, 'Emergency call accepted.');
     response.say('Emergency call accepted. Goodbye.');
     const call = callStatus.find(call => call.sid === sid);
     if (call) {
@@ -154,7 +177,7 @@ app.post('/processResponse', (req, res) => {
     }
   } else if (digit === '2') {
     console.log('Emergency call declined.');
-    logToFile(sender,'Emergency call declined.');
+    logToFile(sender, 'Emergency call declined.');
     response.say('Emergency call declined. Goodbye.');
     const call = callStatus.find(call => call.sid === sid);
     if (call) {
@@ -162,7 +185,7 @@ app.post('/processResponse', (req, res) => {
     }
   } else {
     console.log('Invalid input.');
-    logToFile(sender,'Invalid input.');
+    logToFile(sender, 'Invalid input.');
     response.say('Invalid input. Goodbye.');
     const call = callStatus.find(call => call.sid === sid);
     if (call) {
@@ -179,7 +202,7 @@ app.post('/notanswered', (req, res) => {
   console.log('SID:', sid);
   const call = callStatus.find(call => call.sid === sid);
   const sender = call ? call.phone : 'unknown';
-  logToFile(sender,'No response received for SID: ' + sid);
+  logToFile(sender, 'No response received for SID: ' + sid);
   if (call) {
     call.status = 'No Response';
   }
@@ -187,36 +210,35 @@ app.post('/notanswered', (req, res) => {
   res.send('No response received.');
 });
 
-// Function to update call status file
-function updateCallStatusFile() {
-  fs.writeFile(path.join(__dirname, 'call_status.json'), JSON.stringify(callStatus, null, 2), (err) => {
-    if (err) {
-      console.error('Error writing to call status file:', err);
-    }
-  });
+// Function to update call status in Firestore
+async function updateCallStatusFile() {
+  try {
+    // Clear existing call_status collection
+    const callStatusSnapshot = await db.collection('call_status').get();
+    const batchDelete = db.batch();
+    callStatusSnapshot.docs.forEach(doc => batchDelete.delete(doc.ref));
+    await batchDelete.commit();
+
+    // Add new call status entries
+    const batchSet = db.batch();
+    callStatus.forEach(call => {
+      const docRef = db.collection('call_status').doc(call.sid);
+      batchSet.set(docRef, call);
+    });
+    await batchSet.commit();
+  } catch (error) {
+    console.error('Error updating call status in Firestore:', error);
+  }
 }
 
-app.get('/callReport', (_, res) => {
+app.get('/callReport', async (_, res) => {
   updateCallStatusFile();
-  fs.readFile(path.join(__dirname, 'call_status.json'), 'utf8', (err, callData) => {
-    if (err) {
-      return res.status(500).send({ message: 'Error reading call status file', error: err });
-    }
-    let callStatus = [];
-    if (callData) {
-      try {
-        callStatus = JSON.parse(callData);
-      } catch (parseError) {
-        console.error('Error parsing call status file:', parseError);
-      }
-    }
-
-    fs.readFile(path.join(__dirname, 'public', 'members.json'), 'utf8', (err, memberData) => {
-      if (err) {
-        return res.status(500).send({ message: 'Error reading members file', error: err });
-      }
-
-      const members = JSON.parse(memberData);
+  try {
+    const callStatusSnapshot = await db.collection('call_status').get();
+    const callStatus = callStatusSnapshot.docs.map(doc => doc.data());
+    try {
+      const membersSnapshot = await db.collection('members').get();
+      const members = membersSnapshot.docs.map(doc => doc.data());
 
       const report = callStatus.map(call => {
         const member = members.find(member => member.phone === call.phone);
@@ -226,63 +248,57 @@ app.get('/callReport', (_, res) => {
         };
       });
       res.status(200).send(report);
-    });
-  });
+    } catch (error) {
+      res.status(500).send({ message: 'Error reading members from Firestore', error });
+    }
+  } catch (error) {
+    res.status(500).send({ message: 'Error reading call status from Firestore', error });
+  }
 });
 
-app.post('/removeMember', (req, res) => {
+app.post('/removeMember', async (req, res) => {
   console.log('Request received:', req.body);
   const { phone } = req.body;
 
-  fs.readFile(path.join(__dirname, 'public', 'members.json'), 'utf8', (err, data) => {
-    if (err) {
-      return res.status(500).send({ message: 'Error reading members file', error: err });
+  try {
+    const membersRef = db.collection('members');
+    const snapshot = await membersRef.where('phone', '==', phone).get();
+    if (snapshot.empty) {
+      return res.status(404).send({ message: 'Member not found' });
     }
 
-    let members = [];
-    if (data) {
-      members = JSON.parse(data);
-    }
-
-    const updatedMembers = members.filter(member => member.phone !== phone);
-
-    fs.writeFile(path.join(__dirname, 'public', 'members.json'), JSON.stringify(updatedMembers, null, 2), (err) => {
-      if (err) {
-        return res.status(500).send({ message: 'Error writing to members file', error: err });
-      }
-
-      res.status(200).send({ message: 'Member removed successfully' });
+    snapshot.forEach(doc => {
+      doc.ref.delete();
     });
-  });
+
+    res.status(200).send({ message: 'Member removed successfully' });
+  } catch (error) {
+    res.status(500).send({ message: 'Error removing member from Firestore', error });
+  }
 });
 
-app.post('/addMember', (req, res) => {
+app.post('/addMember', async (req, res) => {
   console.log('Request received:', req.body);
   const { name, phone } = req.body;
   const newMember = { name, phone };
 
-  fs.readFile(path.join(__dirname, 'public', 'members.json'), 'utf8', (err, data) => {
-    if (err) {
-      return res.status(500).send({ message: 'Error reading members file', error: err });
-    }
-
-    let members = [];
-    if (data) {
-      members = JSON.parse(data);
-    }
-
-    members.push(newMember);
-
-    fs.writeFile(path.join(__dirname, 'public', 'members.json'), JSON.stringify(members, null, 2), (err) => {
-      if (err) {
-        return res.status(500).send({ message: 'Error writing to members file', error: err });
-      }
-
-      res.status(200).send({ message: 'Member added successfully' });
-    });
-  });
+  try {
+    await db.collection('members').add(newMember);
+    res.status(200).send({ message: 'Member added successfully' });
+  } catch (error) {
+    res.status(500).send({ message: 'Error adding member to Firestore', error });
+  }
 });
 
+app.get('/allmembers', async (req, res) => {
+  try {
+    const membersSnapshot = await db.collection('members').get();
+    const members = membersSnapshot.docs.map(doc => doc.data());
+    res.status(200).json(members);
+  } catch (error) {
+    res.status(500).send({ message: 'Error retrieving members from Firestore', error });
+  }
+});
 app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
