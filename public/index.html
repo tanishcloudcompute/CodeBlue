@@ -354,7 +354,7 @@
       }
     }
     async function fetchMembers() {
-      const response = await fetch('/members.json');
+      const response = await fetch('/allmembers');
       return response.ok ? await response.json() : [];
     }
 
@@ -432,7 +432,7 @@
         tbody.appendChild(row);
       });
     }
-  
+    loadMembers();
     async function removeMember(phone) {
       const response = await fetch('/removeMember', {
         method: 'POST',
