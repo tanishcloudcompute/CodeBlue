@@ -3,12 +3,18 @@
   "version": "1.0.0",
   "description": "CodeBlue application",
   "main": "caller.js",
+  "type": "module",
   "scripts": {
     "start": "node caller.js"
   },
   "dependencies": {
+    "@firebase/firestore": "^4.7.10",
+    "@google-cloud/firestore": "^7.11.0",
+    "@google-cloud/storage": "^7.15.2",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "twilio": "^5.4.4"
+    "firebase": "^11.5.0",
+    "firebase-admin": "^13.2.0",
+    "twilio": "^5.5.0"
   }
 }
