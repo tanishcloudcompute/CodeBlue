@@ -20,15 +20,8 @@ app.use(bodyParser.urlencoded({ extended: false }));
 const accountSid = process.env.TWILIO_SID;
 const authToken = process.env.TWILIO_AUTH;
 
-// Dynamic import with assertion
-const serviceAccount = JSON.parse(
-    fs.readFileSync(path.join(__dirname, 'serviceAccountKey.json'), 'utf8')
-);
-
 // Initialize the Firebase Admin SDK with your credentials.
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+admin.initializeApp();
 
 // Get a Firestore instance.
 const db = admin.firestore();
@@ -316,6 +309,6 @@ app.get('/service-status', (req, res) => {
   res.status(200).json(serviceStatus);
 });
 
-app.listen(3000, () => {
-  console.log('Server is running on port 3000');
+app.listen(3001, () => {
+  console.log('Server is running on port 3001');
 });
