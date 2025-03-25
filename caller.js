@@ -134,7 +134,8 @@ app.post('/callStatus', async (req, res) => {
     const hotlineSnapshot = await hotlineRef.get();
     const hotlineDoc = hotlineSnapshot.docs[0];
     const hotlineId = hotlineDoc.id;
-    const call = await getCallStatusBySid(sid,hotlineId);
+    const hotlineData = hotlineDoc.data();
+    const call = hotlineData.callStatus.find(entry => entry.sid === sid);
     if (call) {
       await updateCallStatus(sid, hotlineId, `Not Responded ${call.tryNumber}st Call`,call.tryNumber+1);
     }else{
@@ -313,7 +314,8 @@ app.post('/processResponse', async (req, res) => {
   const hotlineSnapshot = await hotlineRef.get();
   const hotlineDoc = hotlineSnapshot.docs[0];
   const hotlineId = hotlineDoc.id;
-  const call = await getCallStatusBySid(sid,hotlineId);
+  const hotlineData = hotlineDoc.data();
+  const call = hotlineData.callStatus.find(entry => entry.sid === sid);
   const sender = call ? call.phone : 'unknown';
   logToFile(sender, 'Received input: ' + digit);
   if (digit === '1') {
@@ -344,7 +346,8 @@ app.post('/notanswered', async (req, res) => {
   const hotlineSnapshot = await hotlineRef.get();
   const hotlineDoc = hotlineSnapshot.docs[0];
   const hotlineId = hotlineDoc.id;
-  const call = await getCallStatusBySid(sid,hotlineId);
+  const hotlineData = hotlineDoc.data();
+  const call = hotlineData.callStatus.find(entry => entry.sid === sid);
   const sender = call ? call.phone : 'unknown';
   logToFile(sender, 'No response received for SID: ' + sid);
   if (call) {
@@ -353,29 +356,6 @@ app.post('/notanswered', async (req, res) => {
   console.log('No response received.');
   res.send('No response received.');
 });
-
-// Helper function to get the call status by SID using Firestore
-async function getCallStatusBySid(sid, hotlineId) {
-  try {
-    const hotlineRef = db.collection('codeblue_history').doc(hotlineId);
-    const callStatus = await db.runTransaction(async (transaction) => {
-      const hotlineDoc = await transaction.get(hotlineRef);
-      if (!hotlineDoc.exists) {
-        throw new Error('Hotline document does not exist!');
-      }
-      const hotlineData = hotlineDoc.data();
-      const status = hotlineData.callStatus.find(entry => entry.sid === sid);
-      if (!status) {
-        throw new Error('Call status not found');
-      }
-      return status;
-    });
-    return callStatus;
-  } catch (error) {
-    console.error('Error fetching call status from Firestore:', error);
-    throw new Error('Error fetching call status from Firestore');
-  }
-}
 
 async function updateCallStatus(sid, hotlineId, status, tryNumber = 1) {
   const hotlineRef = db.collection('codeblue_history').doc(hotlineId);
