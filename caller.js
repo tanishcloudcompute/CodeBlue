@@ -27,7 +27,9 @@ const authToken = process.env.TWILIO_AUTH;
 // );
 
 // Initialize the Firebase Admin SDK with your credentials.
-admin.initializeApp();
+admin.initializeApp(
+  // {credential: admin.credential.cert(serviceAccount)}
+);
 
 // Get a Firestore instance.
 const db = admin.firestore();
@@ -143,6 +145,92 @@ app.post('/callStatus', async (req, res) => {
   // Always respond with a 200 OK so Twilio knows the callback was processed
   res.sendStatus(200);
 });
+// Helper sleep function that returns a Promise which resolves after a given time in ms.
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function runHotlineProcess(hotlineId) {
+  // Define hotlineRef using the provided hotlineId
+  const hotlineRef = db.collection('codeblue_history').doc(hotlineId);
+
+  // Wait for 120 seconds
+  await sleep(120000);
+
+  // Check the list of active numbers
+  let hotlineDoc = await hotlineRef.get();
+  let hotlineData = hotlineDoc.data();
+  let activeNumbers = hotlineData.callStatus
+    .filter(entry => entry.status !== 'Accepted' && entry.status !== 'Declined')
+    .map(entry => entry.phone);
+
+  if (activeNumbers.length > 0) {
+    // Perform a batch update
+    await bulkCall(activeNumbers, hotlineId);
+
+    // Wait for another 3 minutes
+    await sleep(240000);
+
+    // Check active numbers again
+    hotlineDoc = await hotlineRef.get();
+    hotlineData = hotlineDoc.data();
+    activeNumbers = hotlineData.callStatus
+      .filter(entry => entry.status !== 'Accepted' && entry.status !== 'Declined')
+      .map(entry => entry.phone);
+
+    if (activeNumbers.length > 0) {
+      await bulkCall(activeNumbers, hotlineId);
+
+      // Wait for 1 minute before sending WhatsApp messages
+      await sleep(90000);
+
+      // Check active numbers again
+      hotlineDoc = await hotlineRef.get();
+      hotlineData = hotlineDoc.data();
+      activeNumbers = hotlineData.callStatus
+        .filter(entry => entry.status !== 'Accepted' && entry.status !== 'Declined')
+        .map(entry => entry.phone);
+
+      // Send WhatsApp messages sequentially to all active numbers
+      for (const phone of activeNumbers) {
+        try {
+          await client.messages.create({
+            from: 'whatsapp:+18313221097', // Your Twilio WhatsApp number
+            to: `whatsapp:${phone}`,       // The recipient’s WhatsApp number
+            contentSid: 'HXfb1f06b0d16236b6d06ae5b18956ba7b' // The approved message template SID
+          });
+        } catch (error) {
+          console.error('Error sending WhatsApp message:', error);
+        }
+      }
+
+      // Wait for another minute before sending a report
+      await sleep(60000);
+
+    }
+  }
+  try {
+  hotlineDoc = await hotlineRef.get();
+  hotlineData = hotlineDoc.data();
+  const callStatus = hotlineData.callStatus;
+
+  const membersSnapshot = await db.collection('members').get();
+  const members = membersSnapshot.docs.map(doc => doc.data());
+
+  const report = callStatus.map(entry => {
+    const member = members.find(member => member.phone === entry.phone);
+    const name = member ? member.name : 'Unknown';
+    return `Name: ${name}, Status: ${entry.status}`;
+  }).join('\n');
+  await client.messages.create({
+    from: 'whatsapp:+18313221097', // Your Twilio WhatsApp number
+    to: 'whatsapp:+919979449268',   // The recipient’s WhatsApp number
+    body: `Call Status Report:\n${report}`
+  });
+  console.log('Call status report sent successfully.');
+} catch (error) {
+  console.error('Error sending call status report:', error);
+}
+
+}
 
 app.post('/hotline', async (req, res) => {
   // Create a new entry in codeblue_history with the current date-time and an empty callStatus array
@@ -172,82 +260,12 @@ app.post('/hotline', async (req, res) => {
 
     // Perform the bulk call
     await bulkCall(phoneNumbers, hotlineId);
-
-    // Wait for 60 seconds and check the list of active numbers
-    setTimeout(async () => {
-      const hotlineDoc = await hotlineRef.get();
-      const hotlineData = hotlineDoc.data();
-      const activeNumbers = hotlineData.callStatus
-        .filter(entry => entry.status !== 'Accepted' && entry.status !== 'Declined')
-        .map(entry => entry.phone);
-
-      if (activeNumbers.length > 0) {
-        // Perform a single batch update for tryNumber and status
-        await bulkCall(activeNumbers,hotlineId);
-
-        // Wait for another 3 minutes and check the list of active numbers again
-        setTimeout(async () => {
-          const hotlineDoc = await hotlineRef.get();
-          const hotlineData = hotlineDoc.data();
-          const activeNumbers = hotlineData.callStatus
-            .filter(entry => entry.status !== 'Accepted' && entry.status !== 'Declined')
-            .map(entry => entry.phone);
-          if (activeNumbers.length > 0) {
-            await bulkCall(activeNumbers,hotlineId);
-            // Wait for 1 minute before sending WhatsApp messages to active numbers
-            setTimeout(async () => {
-              const hotlineDoc = await hotlineRef.get();
-              const hotlineData = hotlineDoc.data();
-              const activeNumbers = hotlineData.callStatus
-                .filter(entry => entry.status !== 'Accepted' && entry.status !== 'Declined')
-                .map(entry => entry.phone);
-              activeNumbers.forEach(async phone => {
-              try {
-                await client.messages.create({
-                from: 'whatsapp:+18313221097', // Your Twilio WhatsApp number
-                to: `whatsapp:${phone}`,    // The recipient’s WhatsApp number
-                contentSid: 'HXfb1f06b0d16236b6d06ae5b18956ba7b', // The SID for the approved message template
-                });
-              } catch (error) {
-                console.error('Error sending WhatsApp message:', error);
-              }
-              });
-              
-            }, 60000); // 1 minute in milliseconds
-          }
-        }, 180000); // 3 minutes in milliseconds
-      }
-    }, 60000); // 1 minute in milliseconds
-    // Wait for 1 minute before sending the report of all callStatus
-    setTimeout(async () => {
-      try {
-        const hotlineDoc = await hotlineRef.get();
-        const hotlineData = hotlineDoc.data();
-        const callStatus = hotlineData.callStatus;
-
-        const membersSnapshot = await db.collection('members').get();
-        const members = membersSnapshot.docs.map(doc => doc.data());
-
-        const report = callStatus.map(entry => {
-          const member = members.find(member => member.phone === entry.phone);
-          const name = member ? member.name : 'Unknown';
-          return `Name: ${name}, Status: ${entry.status}`;
-        }).join('\n');
-        await client.messages.create({
-          from: 'whatsapp:+18313221097', // Your Twilio WhatsApp number
-          to: 'whatsapp:+919979449268',  // The recipient’s WhatsApp number
-          body: `Call Status Report:\n${report}`
-        });
-        console.log('Call status report sent successfully.');
-      } catch (error) {
-        console.error('Error sending call status report:', error);
-      }
-    }, 300000); // 1 minute in milliseconds
-    res.status(200).send("Hotline calls initiated.");
-  } catch (error) {
-    res.status(500).send({ message: 'Error reading members from Firestore', error });
+    runHotlineProcess(hotlineId);
   }
-
+  catch (error) {
+    console.error('Error starting hotline:', error);
+    res.status(500).send('Error starting hotline');
+  }
 });
 
 app.post('/whatsappYes', async (req, res) => {
@@ -360,18 +378,31 @@ async function getCallStatusBySid(sid, hotlineId) {
   }
 }
 
-async function updateCallStatus(sid, hotlineId, status,tryNumber=1) {
+async function updateCallStatus(sid, hotlineId, status, tryNumber = 1) {
   const hotlineRef = db.collection('codeblue_history').doc(hotlineId);
-  const hotlineDoc = await hotlineRef.get();
-  const hotlineData = hotlineDoc.data();
-  const callStatus = hotlineData.callStatus.map(entry => {
-    if (entry.sid === sid) {
-      return { ...entry, status, tryNumber };
-    }
-    return entry;
-  });
-  await hotlineRef.update({ callStatus });
+  
+  try {
+    await db.runTransaction(async (transaction) => {
+      const hotlineDoc = await transaction.get(hotlineRef);
+      if (!hotlineDoc.exists) {
+        throw new Error("Hotline document does not exist!");
+      }
+      const hotlineData = hotlineDoc.data();
+
+      // Update the callStatus array atomically
+      const updatedCallStatus = hotlineData.callStatus.map(entry => {
+        return entry.sid === sid ? { ...entry, status, tryNumber } : entry;
+      });
+
+      // Atomically update the document within the transaction
+      transaction.update(hotlineRef, { callStatus: updatedCallStatus });
+    });
+    console.log("Transaction successfully committed.");
+  } catch (error) {
+    console.error("Transaction failed: ", error);
+  }
 }
+
 
 app.get('/callReport', async (_, res) => {
   try {
